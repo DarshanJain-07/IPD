@@ -5,7 +5,7 @@ opencv-python>=4.5.5.64
 numpy>=1.19.5
 
 # MediaPipe for face landmark detection (ensure you are using a supported Python version)
-mediapipe>=0.10.0.1
+mediapipe>=0.10.21
 
 # PyWavelets for wavelet denoising
 PyWavelets>=1.3.0
