@@ -33,8 +33,8 @@ EPSILON = 1e-6          # Small constant to avoid division by zero.
 PATCH_SIZE = 5          # Size (in pixels) of the patch extracted around each landmark.
 
 # Frequency bounds (in Hz) for heart rate analysis (e.g., 0.65 Hz ~39 BPM, 3.5 Hz ~210 BPM).
-LOW_FREQ_BOUND = 0.65
-HIGH_FREQ_BOUND = 3.5
+LOW_FREQ_BOUND = 0.65 # Lower frequency bound (Hz).
+HIGH_FREQ_BOUND = 3.5   # Upper frequency bound (Hz).
 
 # =============================================================================
 #   Setup Face Landmarker Using the Tasks API
@@ -366,20 +366,29 @@ with FaceLandmarker.create_from_options(options) as face_landmarker:
     # =============================================================================
     #       Main Video Capture and Signal Extraction Loop
     # =============================================================================
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("Cannot open camera.")
-        exit()
+    with FaceLandmarker.create_from_options(options) as face_landmarker:
 
-    capture_started = False
-    start_tick = 0
-    user_signals = []  # List to store the weighted rPPG signal for each captured frame.
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            print("Cannot open camera.")
+            exit()
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("Failed to grab frame.")
-            break
+        capture_started = False
+        start_tick = 0
+
+        # Lists for dynamic frame counting and baseline computation:
+        baseline_signals = []   # Accumulates rPPG values during the initial delay period.
+        valid_signals = []      # Adjusted (and derivative) rPPG values after delay.
+        valid_timestamps = []   # Timestamps (in seconds) for valid frames.
+        last_valid_adjusted = None  # For temporal derivative computation.
+        baseline_computed = False
+        effective_fs = FS  # Default; will update after capture.
+
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("Failed to grab frame.")
+                break
 
         # Convert frame from BGR (OpenCV format) to RGB (required by the Tasks API).
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -409,9 +418,32 @@ with FaceLandmarker.create_from_options(options) as face_landmarker:
         if capture_started and current_face_landmarks:
             # Use the landmarks from the first detected face.
             landmarks = current_face_landmarks[0]
-            if current_time >= DELAY:
+            # Only process if current_time is available
+            if capture_started:
+                current_time = (cv2.getTickCount() - start_tick) / cv2.getTickFrequency()
+            # During the delay period, accumulate baseline signals.
+            if current_time < DELAY:
                 rppg_value = extract_weighted_rppg(rgb_frame, landmarks)
-                user_signals.append(rppg_value)
+                baseline_signals.append(rppg_value)
+            else:
+                # After delay, compute baseline once.
+                if not baseline_computed and len(baseline_signals) > 0:
+                    baseline_value = np.mean(baseline_signals)
+                    baseline_computed = True
+                    print(f"Baseline computed: {baseline_value:.4f}")
+                # Extract the current rPPG value and subtract baseline.
+                rppg_value = extract_weighted_rppg(rgb_frame, landmarks)
+                adjusted_value = rppg_value - baseline_value
+
+                # Compute temporal derivative to enhance alternating features.
+                if last_valid_adjusted is None:
+                    final_value = adjusted_value  # For the first frame after delay.
+                else:
+                    final_value = adjusted_value - last_valid_adjusted
+                last_valid_adjusted = adjusted_value
+
+                valid_signals.append(final_value)
+                valid_timestamps.append(current_time)
             # Reset the global landmarks variable to avoid reusing stale results.
             current_face_landmarks = None
 
@@ -420,7 +452,12 @@ with FaceLandmarker.create_from_options(options) as face_landmarker:
         if key == ord('s'):
             capture_started = True
             start_tick = cv2.getTickCount()
-            user_signals = []  # Reset signal buffer.
+            # Reset all buffers.
+            baseline_signals = []
+            valid_signals = []
+            valid_timestamps = []
+            last_valid_adjusted = None
+            baseline_computed = False
             print("Capture started...")
         elif key == ord('q'):
             break
@@ -428,13 +465,21 @@ with FaceLandmarker.create_from_options(options) as face_landmarker:
     cap.release()
     cv2.destroyAllWindows()
 
-    print(f"User signals captured: {len(user_signals)}")
-    if len(user_signals) < 2:
+    print(f"Valid frames captured: {len(valid_signals)}")
+    if len(valid_signals) < 2:
         print("Not enough data collected. Exiting.")
         exit()
 
-    # Convert the collected signal list to a NumPy array for further processing.
-    user_signals = np.array(user_signals, dtype=np.float32)
+    # Compute effective frame rate based on valid timestamps.
+    duration = valid_timestamps[-1] - valid_timestamps[0]
+    if duration > 0:
+        effective_fs = len(valid_timestamps) / duration
+    else:
+        effective_fs = FS
+    print(f"Effective frame rate: {effective_fs:.2f} FPS")
+
+    # Use the valid_signals (which now contain temporal derivative values) for further processing.
+    user_signals = np.array(valid_signals, dtype=np.float32)
 
     # =============================================================================
     #    Post-Processing Pipeline
@@ -444,10 +489,10 @@ with FaceLandmarker.create_from_options(options) as face_landmarker:
     # Step 2: Apply wavelet denoising to reduce high-frequency noise.
     denoised = wavelet_denoise(detrended, wavelet='db4', level=4)
     # Step 3: Apply a Butterworth bandpass filter to isolate frequencies in the 0.5-3.5 Hz range.
-    filtered = bandpass_filter(denoised, 0.5, 3.5, FS, order=2)
+    filtered = bandpass_filter(denoised, 0.5, 3.5, effective_fs, order=2)
 
     # Option A: Estimate heart rate using a time-domain method (Pan–Tompkins-inspired peak detection).
-    peaks, deriv, squared, integrated = pan_tompkins_peak_detection(filtered, FS)
+    peaks, deriv, squared, integrated = pan_tompkins_peak_detection(filtered, effective_fs)
     if len(peaks) > 1:
         intervals = np.diff(peaks) / FS  # Compute time intervals between peaks (in seconds).
         hr_bpm_time = 60.0 / np.mean(intervals)  # Convert average interval to BPM.
@@ -468,10 +513,10 @@ with FaceLandmarker.create_from_options(options) as face_landmarker:
 
     # Plot 1: Raw weighted rPPG signal, detrended signal, and wavelet-denoised signal.
     plt.subplot(5, 1, 1)
-    plt.plot(user_signals, label='Raw Weighted rPPG Signal (GRGB)')
+    plt.plot(user_signals, label='Raw Valid Signal (Derivative Applied)')
     plt.plot(detrended, label='Detrended Signal')
     plt.plot(denoised, label='Wavelet Denoised Signal')
-    plt.title("Raw, Detrended, and Denoised rPPG Signal (Weighted GRGB)")
+    plt.title("Raw, Detrended, and Denoised rPPG Signal (After Baseline Removal & Derivative)")
     plt.legend()
 
     # Plot 2: Bandpass filtered signal.
