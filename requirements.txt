@@ -15,3 +15,7 @@ matplotlib>=3.3.4
 
 # SciPy for signal processing functions (detrend, filtering, FFT, etc.)
 scipy>=1.5.4
+
+fastapi
+uvicorn
+requests

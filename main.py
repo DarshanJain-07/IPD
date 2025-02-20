@@ -12,6 +12,25 @@ import pywt                    # For wavelet-based denoising
 import matplotlib.pyplot as plt  # For plotting graphs
 from scipy.signal import detrend, filtfilt, butter, find_peaks, convolve  # Signal processing functions
 
+# ==== ADD FOR FASTAPI & THREAD SAFETY (REMOVE LATER if not needed) ====
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
+import threading
+import io
+
+app = FastAPI()
+capture_lock = threading.Lock()
+
+# Global variables for capture state
+capture_started = False
+start_tick = 0
+baseline_signals = []   # Accumulates rPPG values during the delay period.
+valid_signals = []      # Adjusted rPPG values after delay.
+valid_timestamps = []   # Timestamps (in seconds) for valid frames.
+last_valid_adjusted = None
+baseline_computed = False
+# ==== END FASTAPI & THREAD SAFETY IMPORTS ====
+
 # =============================================================================
 #   Setup Tasks API Classes from MediaPipe
 # =============================================================================
@@ -366,109 +385,101 @@ with FaceLandmarker.create_from_options(options) as face_landmarker:
     # =============================================================================
     #       Main Video Capture and Signal Extraction Loop
     # =============================================================================
-    with FaceLandmarker.create_from_options(options) as face_landmarker:
-
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            print("Cannot open camera.")
-            exit()
-
-        capture_started = False
-        start_tick = 0
-
-        # Lists for dynamic frame counting and baseline computation:
-        baseline_signals = []   # Accumulates rPPG values during the initial delay period.
-        valid_signals = []      # Adjusted (and derivative) rPPG values after delay.
-        valid_timestamps = []   # Timestamps (in seconds) for valid frames.
-        last_valid_adjusted = None  # For temporal derivative computation.
-        baseline_computed = False
-        effective_fs = FS  # Default; will update after capture.
-
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                print("Failed to grab frame.")
-                break
-
-        # Convert frame from BGR (OpenCV format) to RGB (required by the Tasks API).
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        # Get the current timestamp in milliseconds.
-        timestamp_ms = int(time.time() * 1000)
-        
-        # Process the frame using the updated MediaPipe integration
-        process_frame(face_landmarker, rgb_frame, timestamp_ms)
-
-        # Provide visual feedback: display "Face Detected" if face landmarks have been received.
-        if current_face_landmarks:
-            cv2.putText(frame, "Face Detected", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        else:
-            cv2.putText(frame, "No Face Detected", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-
-        # If capture is active, display the remaining capture time.
-        if capture_started:
-            current_time = (cv2.getTickCount() - start_tick) / cv2.getTickFrequency()
-            remaining = CAPTURE_DURATION + DELAY - current_time
-            cv2.putText(frame, f"Remaining: {remaining:.2f}s", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
-            if current_time >= (CAPTURE_DURATION + DELAY):
-                print("Capture completed automatically.")
-                capture_started = False
-                break
-
-        # If capturing and face landmarks are available, extract the weighted rPPG signal.
-        if capture_started and current_face_landmarks:
-            # Use the landmarks from the first detected face.
-            landmarks = current_face_landmarks[0]
-            # Only process if current_time is available
-            if capture_started:
-                current_time = (cv2.getTickCount() - start_tick) / cv2.getTickFrequency()
-            # During the delay period, accumulate baseline signals.
-            if current_time < DELAY:
-                rppg_value = extract_weighted_rppg(rgb_frame, landmarks)
-                baseline_signals.append(rppg_value)
-            else:
-                # After delay, compute baseline once.
-                if not baseline_computed and len(baseline_signals) > 0:
-                    baseline_value = np.mean(baseline_signals)
-                    baseline_computed = True
-                    print(f"Baseline computed: {baseline_value:.4f}")
-                # Extract the current rPPG value and subtract baseline.
-                rppg_value = extract_weighted_rppg(rgb_frame, landmarks)
-                adjusted_value = rppg_value - baseline_value
-
-                # Compute temporal derivative to enhance alternating features.
-                if last_valid_adjusted is None:
-                    final_value = adjusted_value  # For the first frame after delay.
+    def capture_loop():
+        global capture_started, start_tick, baseline_signals, valid_signals, valid_timestamps, last_valid_adjusted, baseline_computed
+        with FaceLandmarker.create_from_options(options) as face_landmarker:
+            cap = cv2.VideoCapture(0)
+            if not cap.isOpened():
+                print("Cannot open camera.")
+                return
+            
+            # Lists for dynamic frame counting and baseline computation:
+            with capture_lock:
+                capture_started = True
+                start_tick = cv2.getTickCount()
+                # Reset all buffers.
+                baseline_signals = []   # Accumulates rPPG values during the initial delay period.
+                valid_signals = []      # Adjusted (and derivative) rPPG values after delay.
+                valid_timestamps = []   # Timestamps (in seconds) for valid frames.
+                last_valid_adjusted = None  # For temporal derivative computation.
+                baseline_computed = False
+                print("Capture started automatically via API")
+    
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    print("Failed to grab frame.")
+                    break
+    
+                # Convert frame from BGR to RGB for Tasks API.
+                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                # Get the current timestamp in milliseconds.
+                timestamp_ms = int(time.time() * 1000)
+                
+                # Process the frame using the updated MediaPipe integration
+                process_frame(face_landmarker, rgb_frame, timestamp_ms)
+    
+                # Provide visual feedback: display "Face Detected" if face landmarks have been received.
+                if current_face_landmarks:
+                    cv2.putText(frame, "Face Detected", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
                 else:
-                    final_value = adjusted_value - last_valid_adjusted
-                last_valid_adjusted = adjusted_value
+                    cv2.putText(frame, "No Face Detected", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                
+                # If capture is active, display the remaining capture time.
+                with capture_lock:
+                    if capture_started:
+                        current_time = (cv2.getTickCount() - start_tick) / cv2.getTickFrequency()
+                        remaining = CAPTURE_DURATION + DELAY - current_time
+                        cv2.putText(frame, f"Remaining: {remaining:.2f}s", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 0), 2)
+                        if current_time >= (CAPTURE_DURATION + DELAY):
+                            print("Capture completed automatically.")
+                            capture_started = False
+                            break
+                        
+                        # If capturing and face landmarks are available, extract the weighted rPPG signal.
+                        if current_face_landmarks:
+                            # Use the landmarks from the first detected face.
+                            landmarks = current_face_landmarks[0]
+                            # During the delay period, accumulate baseline signals.
+                            if current_time < DELAY:
+                                rppg_value = extract_weighted_rppg(rgb_frame, landmarks)
+                                baseline_signals.append(rppg_value)
+                            else:
+                                # After delay, compute baseline once.
+                                if not baseline_computed and len(baseline_signals) > 0:
+                                    baseline_value = np.mean(baseline_signals)
+                                    baseline_computed = True
+                                    print(f"Baseline computed: {baseline_value:.4f}")
+                                
+                                # Extract the current rPPG value and subtract baseline.
+                                rppg_value = extract_weighted_rppg(rgb_frame, landmarks)
+                                adjusted_value = rppg_value - baseline_value
+                                
+                                # Compute temporal derivative to enhance alternating features.
+                                if last_valid_adjusted is None:
+                                    final_value = adjusted_value  # For the first frame after delay.
+                                else:
+                                    final_value = adjusted_value - last_valid_adjusted
+                                last_valid_adjusted = adjusted_value
+                                valid_signals.append(final_value)
+                                valid_timestamps.append(current_time)
+                                
+                            # Reset the global landmarks variable to avoid reusing stale results.
+                            current_face_landmarks = None
+    
+                # ==== REMOVE LATER: Display window for debugging ====
+                cv2.imshow("MediaPipe rPPG Capture", frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+                # ==== END REMOVE LATER ====
+    
+            cap.release()
+            cv2.destroyAllWindows()
+            print(f"Valid frames captured: {len(valid_signals)}")
+            if len(valid_signals) < 2:
+                print("Not enough data collected. Exiting.")
+                exit()
 
-                valid_signals.append(final_value)
-                valid_timestamps.append(current_time)
-            # Reset the global landmarks variable to avoid reusing stale results.
-            current_face_landmarks = None
-
-        cv2.imshow("MediaPipe rPPG Capture", frame)
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('s'):
-            capture_started = True
-            start_tick = cv2.getTickCount()
-            # Reset all buffers.
-            baseline_signals = []
-            valid_signals = []
-            valid_timestamps = []
-            last_valid_adjusted = None
-            baseline_computed = False
-            print("Capture started...")
-        elif key == ord('q'):
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
-
-    print(f"Valid frames captured: {len(valid_signals)}")
-    if len(valid_signals) < 2:
-        print("Not enough data collected. Exiting.")
-        exit()
 
     # Compute effective frame rate based on valid timestamps.
     duration = valid_timestamps[-1] - valid_timestamps[0]
@@ -478,6 +489,28 @@ with FaceLandmarker.create_from_options(options) as face_landmarker:
         effective_fs = FS
     print(f"Effective frame rate: {effective_fs:.2f} FPS")
 
+@app.post("/start_capture")
+def start_capture():
+    global capture_started
+    with capture_lock:
+        if not capture_started:
+            capture_thread = threading.Thread(target=capture_loop)
+            capture_thread.start()
+            return {"status": "Capture started"}
+        else:
+            return {"status": "Capture already running"}
+
+@app.get("/time_remaining")
+def time_remaining():
+    with capture_lock:
+        if not capture_started:
+            return {"time_remaining": 0}
+        current_time = (cv2.getTickCount() - start_tick) / cv2.getTickFrequency()
+        remaining = max(0, CAPTURE_DURATION + DELAY - current_time)
+        return {"time_remaining": remaining}
+
+@app.get("/results")
+def get_results():
     # Use the valid_signals (which now contain temporal derivative values) for further processing.
     user_signals = np.array(valid_signals, dtype=np.float32)
 
@@ -502,10 +535,14 @@ with FaceLandmarker.create_from_options(options) as face_landmarker:
     # Option B: Estimate heart rate using frequency-domain analysis (FFT).
     hr_bpm_freq, fft_freq, fft_magnitude = frequency_domain_hr_estimation(filtered, FS)
 
-    # Print both heart rate estimates.
+    # Print results (for debugging purposes; REMOVE LATER if needed)
     print(f"Estimated HR (Time-domain, Pan-Tompkins): {hr_bpm_time:.2f} BPM")
     print(f"Estimated HR (Frequency-domain, FFT): {hr_bpm_freq:.2f} BPM")
+    
+    return {"HR_time_domain": hr_bpm_time, "HR_frequency_domain": hr_bpm_freq}
 
+@app.get("/plot")
+def get_plot():
     # =============================================================================
     #       Plotting Results
     # =============================================================================
@@ -518,7 +555,7 @@ with FaceLandmarker.create_from_options(options) as face_landmarker:
     plt.plot(denoised, label='Wavelet Denoised Signal')
     plt.title("Raw, Detrended, and Denoised rPPG Signal (After Baseline Removal & Derivative)")
     plt.legend()
-
+    
     # Plot 2: Bandpass filtered signal.
     plt.subplot(5, 1, 2)
     plt.plot(filtered, label='Bandpass Filtered Signal')
@@ -548,6 +585,11 @@ with FaceLandmarker.create_from_options(options) as face_landmarker:
     plt.xlabel("Frequency (Hz)")
     plt.ylabel("Magnitude")
     plt.legend()
-
     plt.tight_layout()
-    plt.show()
+
+    # Save plot to a buffer and return as an image.
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+    plt.close()
+    return StreamingResponse(buf, media_type="image/png")
