@@ -19,7 +19,7 @@ import threading
 import io
 
 app = FastAPI()
-capture_lock = threading.Lock()
+capture_thread = threading.Thread(target=capture_loop, daemon=True)
 
 # Global variables for capture state
 capture_started = False
@@ -29,6 +29,7 @@ valid_signals = []      # Adjusted rPPG values after delay.
 valid_timestamps = []   # Timestamps (in seconds) for valid frames.
 last_valid_adjusted = None
 baseline_computed = False
+baseline_value = None   # Added global baseline value variable
 # ==== END FASTAPI & THREAD SAFETY IMPORTS ====
 
 # =============================================================================
@@ -386,7 +387,7 @@ with FaceLandmarker.create_from_options(options) as face_landmarker:
     #       Main Video Capture and Signal Extraction Loop
     # =============================================================================
     def capture_loop():
-        global capture_started, start_tick, baseline_signals, valid_signals, valid_timestamps, last_valid_adjusted, baseline_computed
+        global capture_started, start_tick, baseline_signals, valid_signals, valid_timestamps, last_valid_adjusted, baseline_computed, baseline_value
         with FaceLandmarker.create_from_options(options) as face_landmarker:
             cap = cv2.VideoCapture(0)
             if not cap.isOpened():
@@ -403,6 +404,7 @@ with FaceLandmarker.create_from_options(options) as face_landmarker:
                 valid_timestamps = []   # Timestamps (in seconds) for valid frames.
                 last_valid_adjusted = None  # For temporal derivative computation.
                 baseline_computed = False
+                baseline_value = None
                 print("Capture started automatically via API")
     
             while True:
@@ -453,7 +455,10 @@ with FaceLandmarker.create_from_options(options) as face_landmarker:
                                 
                                 # Extract the current rPPG value and subtract baseline.
                                 rppg_value = extract_weighted_rppg(rgb_frame, landmarks)
-                                adjusted_value = rppg_value - baseline_value
+                                if baseline_value is not None:
+                                    adjusted_value = rppg_value - baseline_value
+                                else:
+                                    adjusted_value = rppg_value
                                 
                                 # Compute temporal derivative to enhance alternating features.
                                 if last_valid_adjusted is None:
@@ -477,17 +482,21 @@ with FaceLandmarker.create_from_options(options) as face_landmarker:
             cv2.destroyAllWindows()
             print(f"Valid frames captured: {len(valid_signals)}")
             if len(valid_signals) < 2:
-                print("Not enough data collected. Exiting.")
-                exit()
-
-
-    # Compute effective frame rate based on valid timestamps.
-    duration = valid_timestamps[-1] - valid_timestamps[0]
-    if duration > 0:
-        effective_fs = len(valid_timestamps) / duration
-    else:
-        effective_fs = FS
-    print(f"Effective frame rate: {effective_fs:.2f} FPS")
+                print("Not enough data collected.")
+                return  # Changed exit() to return gracefully
+    
+    
+    # =============================================================================
+    #   Global Effective Frame Rate Computation (REMOVE LATER if not needed)
+    # =============================================================================
+    # The following block is commented out to ensure the effective frame rate is computed
+    # only after a capture session is run via the API endpoints.
+    # if len(valid_timestamps) >= 2:
+    #     duration = valid_timestamps[-1] - valid_timestamps[0]
+    #     effective_fs = len(valid_timestamps) / duration if duration > 0 else FS
+    # else:
+    #     effective_fs = FS
+    # print(f"Effective frame rate: {effective_fs:.2f} FPS")
 
 @app.post("/start_capture")
 def start_capture():
@@ -521,11 +530,17 @@ def get_results():
     detrended = detrend_signal(user_signals)
     # Step 2: Apply wavelet denoising to reduce high-frequency noise.
     denoised = wavelet_denoise(detrended, wavelet='db4', level=4)
+    # Recompute effective frame rate locally:
+    if len(valid_timestamps) >= 2:
+        duration = valid_timestamps[-1] - valid_timestamps[0]
+        effective_fs_local = len(valid_timestamps) / duration if duration > 0 else FS
+    else:
+        effective_fs_local = FS
     # Step 3: Apply a Butterworth bandpass filter to isolate frequencies in the 0.5-3.5 Hz range.
-    filtered = bandpass_filter(denoised, 0.5, 3.5, effective_fs, order=2)
+    filtered = bandpass_filter(denoised, 0.5, 3.5, effective_fs_local, order=2)
 
     # Option A: Estimate heart rate using a time-domain method (Pan–Tompkins-inspired peak detection).
-    peaks, deriv, squared, integrated = pan_tompkins_peak_detection(filtered, effective_fs)
+    peaks, deriv, squared, integrated = pan_tompkins_peak_detection(filtered, effective_fs_local)
     if len(peaks) > 1:
         intervals = np.diff(peaks) / FS  # Compute time intervals between peaks (in seconds).
         hr_bpm_time = 60.0 / np.mean(intervals)  # Convert average interval to BPM.
@@ -546,6 +561,19 @@ def get_plot():
     # =============================================================================
     #       Plotting Results
     # =============================================================================
+    # Recompute post-processing for plotting:
+    user_signals = np.array(valid_signals, dtype=np.float32)
+    detrended = detrend_signal(user_signals)
+    denoised = wavelet_denoise(detrended, wavelet='db4', level=4)
+    if len(valid_timestamps) >= 2:
+        duration = valid_timestamps[-1] - valid_timestamps[0]
+        effective_fs_local = len(valid_timestamps) / duration if duration > 0 else FS
+    else:
+        effective_fs_local = FS
+    filtered = bandpass_filter(denoised, 0.5, 3.5, effective_fs_local, order=2)
+    peaks, deriv, squared, integrated = pan_tompkins_peak_detection(filtered, effective_fs_local)
+    hr_bpm_freq, fft_freq, fft_magnitude = frequency_domain_hr_estimation(filtered, FS)
+
     plt.figure(figsize=(12, 12))
 
     # Plot 1: Raw weighted rPPG signal, detrended signal, and wavelet-denoised signal.
