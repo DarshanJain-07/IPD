@@ -223,46 +223,113 @@ def assess_signal_quality(ppg_signal, fs):
     Advanced signal quality assessment for rPPG.
     Returns a quality score between 0 and 1.
     """
-    if len(ppg_signal) < fs:  # Need at least 1 second of data
+    if len(ppg_signal) < fs * 2:  # Need at least 2 seconds of data
         return 0
     
-    # 1. SNR in frequency domain
+    # 1. SNR in frequency domain - more extensive analysis
     f, Pxx = signal.welch(ppg_signal, fs=fs, nperseg=min(256, len(ppg_signal)))
-    hr_range = np.logical_and(f >= 0.6, f <= 4.0)  # 36-240 BPM
+    
+    # Expected heart rate range (40-180 BPM)
+    hr_range = np.logical_and(f >= 0.67, f <= 3.0)  
     if not any(hr_range):
         return 0
     
     hr_power = np.sum(Pxx[hr_range])
     total_power = np.sum(Pxx)
-    snr = hr_power / (total_power - hr_power + 1e-10)  # Avoid division by zero
-    snr = min(snr, 1.0)  # Cap at 1.0
     
-    # 2. Periodicity assessment using autocorrelation
-    autocorr = np.correlate(ppg_signal, ppg_signal, mode='full')
-    autocorr = autocorr[len(autocorr)//2:]
-    autocorr /= autocorr[0] + 1e-10  # Normalize, avoid division by zero
-    
-    # Find peaks in autocorrelation
-    min_dist = int(fs / 4)  # Minimum distance between peaks
-    peaks, _ = signal.find_peaks(autocorr, height=0.1, distance=min_dist)
-    
-    if len(peaks) >= 2:
-        periodicity = np.mean(autocorr[peaks[:2]])
+    # Find dominant frequency in HR range
+    if any(hr_range):
+        peak_idx = np.argmax(Pxx[hr_range])
+        peak_freq = f[hr_range][peak_idx]
+        peak_power = Pxx[hr_range][peak_idx]
+        
+        # Calculate signal-to-noise ratio around peak
+        peak_width = 0.15  # Hz around peak to consider as signal
+        signal_range = np.logical_and(f >= peak_freq - peak_width, f <= peak_freq + peak_width)
+        signal_power = np.sum(Pxx[signal_range])
+        noise_power = total_power - signal_power
+        snr = signal_power / (noise_power + 1e-10)
     else:
-        periodicity = 0
+        snr = 0
+        
+    snr = min(snr * 2, 1.0)  # Scale and cap at 1.0
     
-    # 3. Waveform quality - use kurtosis as PPG signals typically have specific shape
-    try:
-        kurt = scipy.stats.kurtosis(ppg_signal)
-        # PPG signals should have positive kurtosis (more peaked than normal)
-        kurt_score = min(max((kurt + 3) / 6, 0), 1)  # Normalize kurtosis score
-    except:
-        kurt_score = 0
+    # 2. Signal stability assessment
+    # Calculate coefficient of variation in time windows
+    window_size = int(fs)  # 1-second windows
+    n_windows = len(ppg_signal) // window_size
     
-    # Combine metrics with weights
-    quality_score = 0.5 * snr + 0.3 * periodicity + 0.2 * kurt_score
+    if n_windows >= 2:
+        window_means = []
+        window_stds = []
+        
+        for i in range(n_windows):
+            window = ppg_signal[i*window_size:(i+1)*window_size]
+            window_means.append(np.mean(window))
+            window_stds.append(np.std(window))
+        
+        # Coefficient of variation between windows
+        cv_means = np.std(window_means) / (np.mean(window_means) + 1e-10)
+        stability = max(0, 1 - cv_means)
+    else:
+        stability = 0.5  # Default when not enough data
+    
+    # 3. Waveform quality using temporal consistency
+    # PPG signals should have consistent peak-to-peak intervals
+    peaks, _ = signal.find_peaks(ppg_signal, distance=int(fs*0.5))  # Min distance 0.5s
+    
+    if len(peaks) >= 3:
+        intervals = np.diff(peaks)
+        # Coefficient of variation of intervals (lower is better)
+        cv_intervals = np.std(intervals) / (np.mean(intervals) + 1e-10)
+        consistency = max(0, 1 - min(cv_intervals, 1.0))
+    else:
+        consistency = 0  # Not enough peaks
+    
+    # Combine metrics with weights adjusted based on their reliability
+    quality_score = 0.5 * snr + 0.3 * stability + 0.2 * consistency
+    
+    # Apply more aggressive thresholding for low quality signals
+    if quality_score < 0.3:
+        quality_score *= 0.5  # Further reduce low quality scores
     
     return min(quality_score, 1.0)  # Ensure score is in [0,1]
+
+def update_heart_rate_display(self):
+    """Update heart rate display with confidence indicator."""
+    selected_method = self.selected_method.get()
+    hr = self.heart_rates[selected_method]
+    quality = self.signal_qualities[selected_method]
+    
+    # Only display heart rate if quality is sufficient
+    if hr > 0 and quality >= SIGNAL_QUALITY_THRESHOLD:
+        # Create confidence indicator based on quality
+        if quality >= 0.7:
+            confidence = "High"
+            color = (0, 255, 0)  # Green
+        elif quality >= 0.5:
+            confidence = "Medium"
+            color = (0, 255, 255)  # Yellow
+        else:
+            confidence = "Low"
+            color = (0, 165, 255)  # Orange
+        
+        self.hr_label.config(text=f"Heart Rate: {int(hr)} BPM")
+        self.quality_label.config(text=f"Confidence: {confidence} ({quality:.2f})")
+        
+        # Display on frame
+        cv2.putText(self.display_frame, f"HR: {int(hr)} BPM", (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+        cv2.putText(self.display_frame, f"Confidence: {confidence}", (10, 60), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+    else:
+        self.hr_label.config(text="Heart Rate: -- BPM")
+        self.quality_label.config(text="Confidence: Too Low")
+        
+        cv2.putText(self.display_frame, "Signal too weak", (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+        cv2.putText(self.display_frame, "Please hold still", (10, 60), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
 
 # --- GUI Class ---
 class FaceDetectionGUI:
@@ -432,8 +499,8 @@ class FaceDetectionGUI:
         return roi_data, frame
     
     def process_ppg_signal(self, method, frames_data):
-        """Process PPG signal using selected method and calculate heart rate."""
-        if len(frames_data) < 30:  # Need at least 30 frames for processing
+        """Process PPG signal using selected method and calculate heart rate with improved stability."""
+        if len(frames_data) < 60:  # Increase minimum frames required (2 seconds at 30 FPS)
             return 0, 0, []
         
         # Extract PPG signal based on the selected method
@@ -448,45 +515,76 @@ class FaceDetectionGUI:
         elif method == "ICA":
             ppg_signal = ica_method(frames_data)
         
-        if len(ppg_signal) < 30:
+        if len(ppg_signal) < 60:
             return 0, 0, []
         
-        # Apply bandpass filter
-        nyquist = max(self.smoothed_fps / 2, 4.0)  # Ensure minimum Nyquist freq of 4 Hz
+        # Detrend the signal to remove slow drifts
+        ppg_signal = signal.detrend(ppg_signal)
         
-        # Set cutoff frequencies for 30-240 BPM (0.5-4 Hz) heart rate range
-        low = max(0.5 / nyquist, 0.01)  # Minimum value of 0.01
-        high = min(4.0 / nyquist, 0.99)  # Maximum value of 0.99
+        # Apply bandpass filter
+        nyquist = max(self.smoothed_fps / 2, 4.0)
+        
+        # Set cutoff frequencies for 40-180 BPM (0.67-3 Hz) - narrower, more realistic HR range
+        low = max(0.67 / nyquist, 0.05)
+        high = min(3.0 / nyquist, 0.95)
         
         # Ensure that low < high with a minimum difference
         if low >= high or (high - low) < 0.1:
-            # If frequencies are too close or invalid, use default values
             low = 0.1
-            high = 0.9
+            high = 0.8
         
-        # Only apply filter if frequencies are valid
+        # Apply filter
         try:
             b, a = signal.butter(2, [low, high], btype='band')
             filtered_signal = signal.filtfilt(b, a, ppg_signal)
         except Exception as e:
             print(f"Filter error: {str(e)}")
-            filtered_signal = ppg_signal  # Use unfiltered signal as fallback
+            filtered_signal = ppg_signal
+        
+        # Apply a moving average smoothing to reduce noise
+        window_size = int(self.smoothed_fps / 4)  # 0.25 seconds window
+        window_size = max(3, window_size)
+        if window_size % 2 == 0:
+            window_size += 1  # Ensure odd window size
+        filtered_signal = signal.savgol_filter(filtered_signal, window_size, 2)
         
         # Calculate heart rate
         peaks, heart_rate, _, quality = pan_tompkins(filtered_signal, self.smoothed_fps)
         
-        # Heart rate validation and smoothing
+        # More aggressive heart rate validation
         if heart_rate > 0:
-            self.heart_rate_histories[method].append(heart_rate)
-            if len(self.heart_rate_histories[method]) > HEART_RATE_SMOOTHING_WINDOW:
-                self.heart_rate_histories[method].pop(0)
-            
-            # Median filtering for robustness
-            smoothed_hr = np.median(self.heart_rate_histories[method])
-            self.heart_rates[method] = smoothed_hr
-            self.signal_qualities[method] = quality
+            # Only update if quality is above threshold
+            if quality >= SIGNAL_QUALITY_THRESHOLD:
+                # Rate of change limitation - reject implausible jumps
+                if len(self.heart_rate_histories[method]) > 0:
+                    last_hr = self.heart_rate_histories[method][-1]
+                    max_change = 10  # Maximum 10 BPM change between readings
+                    
+                    if abs(heart_rate - last_hr) > max_change:
+                        # Large jump detected, apply stronger filtering
+                        if len(self.heart_rate_histories[method]) >= 3:
+                            # Use more history for smoothing when jumps occur
+                            heart_rate = 0.7 * last_hr + 0.3 * heart_rate
+                        else:
+                            # Not enough history, be more conservative
+                            heart_rate = 0.9 * last_hr + 0.1 * heart_rate
+                
+                # Add to history
+                self.heart_rate_histories[method].append(heart_rate)
+                if len(self.heart_rate_histories[method]) > HEART_RATE_SMOOTHING_WINDOW:
+                    self.heart_rate_histories[method].pop(0)
+                
+                # Use median filter for final output - robust against outliers
+                smoothed_hr = np.median(self.heart_rate_histories[method])
+                self.heart_rates[method] = round(smoothed_hr)  # Round to nearest integer
+                self.signal_qualities[method] = quality
+            else:
+                # If signal quality is poor, keep the last good heart rate
+                if len(self.heart_rate_histories[method]) > 0:
+                    # But reduce confidence (quality) over time
+                    self.signal_qualities[method] = max(0, self.signal_qualities[method] - 0.05)
         
-        return self.heart_rates[method], quality, filtered_signal
+        return self.heart_rates[method], self.signal_qualities[method], filtered_signal
     
     def update_frame(self):
         """Process each frame and update the GUI."""
