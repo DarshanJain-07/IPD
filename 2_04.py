@@ -174,6 +174,8 @@ def pan_tompkins(ppg_signal, fs):
     nyquist = fs / 2
     low = 0.5 / nyquist
     high = 4.0 / nyquist
+    if high >= 1:
+        high = 0.99
     b, a = signal.butter(2, [low, high], btype='band')
     filtered_signal = signal.filtfilt(b, a, ppg_signal)
     
@@ -216,16 +218,16 @@ def pan_tompkins(ppg_signal, fs):
     
     return peaks.tolist(), heart_rate, filtered_signal.tolist(), quality
 
-def assess_signal_quality(signal, fs):
+def assess_signal_quality(ppg_signal, fs):
     """
     Advanced signal quality assessment for rPPG.
     Returns a quality score between 0 and 1.
     """
-    if len(signal) < fs:  # Need at least 1 second of data
+    if len(ppg_signal) < fs:  # Need at least 1 second of data
         return 0
     
     # 1. SNR in frequency domain
-    f, Pxx = signal.welch(signal, fs=fs, nperseg=min(256, len(signal)))
+    f, Pxx = signal.welch(ppg_signal, fs=fs, nperseg=min(256, len(ppg_signal)))
     hr_range = np.logical_and(f >= 0.6, f <= 4.0)  # 36-240 BPM
     if not any(hr_range):
         return 0
@@ -236,7 +238,7 @@ def assess_signal_quality(signal, fs):
     snr = min(snr, 1.0)  # Cap at 1.0
     
     # 2. Periodicity assessment using autocorrelation
-    autocorr = np.correlate(signal, signal, mode='full')
+    autocorr = np.correlate(ppg_signal, ppg_signal, mode='full')
     autocorr = autocorr[len(autocorr)//2:]
     autocorr /= autocorr[0] + 1e-10  # Normalize, avoid division by zero
     
@@ -251,7 +253,7 @@ def assess_signal_quality(signal, fs):
     
     # 3. Waveform quality - use kurtosis as PPG signals typically have specific shape
     try:
-        kurt = scipy.stats.kurtosis(signal)
+        kurt = scipy.stats.kurtosis(ppg_signal)
         # PPG signals should have positive kurtosis (more peaked than normal)
         kurt_score = min(max((kurt + 3) / 6, 0), 1)  # Normalize kurtosis score
     except:
@@ -276,7 +278,7 @@ class FaceDetectionGUI:
         # Create method menu
         method_menu = tk.Menu(menubar, tearoff=0)
         self.selected_method = tk.StringVar()
-        self.selected_method.set(DETECTION_METHODS[0])  # Default to GREEN
+        self.selected_method.set(DETECTION_METHODS[1])  # Default to GREEN
         
         for method in DETECTION_METHODS:
             method_menu.add_radiobutton(label=method, variable=self.selected_method, 
@@ -327,9 +329,9 @@ class FaceDetectionGUI:
             self.method_results[method] = label
         
         # --- Face Region Data ---
-        self.forehead_points = [10, 8, 9, 151, 337, 338, 10]  # Forehead region
-        self.left_cheek_points = [127, 162, 21, 54, 103, 67, 109, 127]  # Left cheek
-        self.right_cheek_points = [356, 389, 251, 284, 332, 297, 338, 356]  # Right cheek
+        self.forehead_points = [103, 67, 109, 10, 338, 297, 332, 333, 334, 296, 336, 285, 417, 351, 419, 197, 196, 122, 193, 55, 107, 66, 105, 104, 103] # Forehead region
+        self.left_cheek_points = [345, 340, 346, 347, 348, 349, 329, 371, 266, 425, 411, 352, 345]  # Left cheek
+        self.right_cheek_points = [116, 111, 117, 118, 119, 120, 100, 142, 36, 205, 187, 123, 116]  # Right cheek
         
         # --- Data Storage ---
         self.frames_data = []
@@ -450,11 +452,25 @@ class FaceDetectionGUI:
             return 0, 0, []
         
         # Apply bandpass filter
-        nyquist = self.smoothed_fps / 2
-        low = 0.5 / nyquist
-        high = 4.0 / nyquist
-        b, a = signal.butter(2, [low, high], btype='band')
-        filtered_signal = signal.filtfilt(b, a, ppg_signal)
+        nyquist = max(self.smoothed_fps / 2, 4.0)  # Ensure minimum Nyquist freq of 4 Hz
+        
+        # Set cutoff frequencies for 30-240 BPM (0.5-4 Hz) heart rate range
+        low = max(0.5 / nyquist, 0.01)  # Minimum value of 0.01
+        high = min(4.0 / nyquist, 0.99)  # Maximum value of 0.99
+        
+        # Ensure that low < high with a minimum difference
+        if low >= high or (high - low) < 0.1:
+            # If frequencies are too close or invalid, use default values
+            low = 0.1
+            high = 0.9
+        
+        # Only apply filter if frequencies are valid
+        try:
+            b, a = signal.butter(2, [low, high], btype='band')
+            filtered_signal = signal.filtfilt(b, a, ppg_signal)
+        except Exception as e:
+            print(f"Filter error: {str(e)}")
+            filtered_signal = ppg_signal  # Use unfiltered signal as fallback
         
         # Calculate heart rate
         peaks, heart_rate, _, quality = pan_tompkins(filtered_signal, self.smoothed_fps)
@@ -480,13 +496,15 @@ class FaceDetectionGUI:
             if not ret:
                 return
             
-            # Calculate frame rate
+            # Calculate frame rate with sanity checks
             current_time = time.perf_counter()
             elapsed = current_time - self.previous_time
             self.previous_time = current_time
-            
+
             if elapsed > 0:
                 fps = 1.0 / elapsed
+                # Constrain FPS to reasonable values
+                fps = min(max(fps, 8.0), 60.0)  # Clamp between 8 and 60 FPS
                 self.fps_history.append(fps)
                 if len(self.fps_history) > FRAME_RATE_WINDOW:
                     self.fps_history.pop(0)
