@@ -586,6 +586,42 @@ class FaceDetectionGUI:
         
         return self.heart_rates[method], self.signal_qualities[method], filtered_signal
     
+    def track_perfect_signals(self):
+        """
+        Track perfect signal values (quality = 1) and calculate a 10-value moving average.
+        Updates the method comparison display with this information.
+        """
+        # Initialize perfect signal arrays if they don't exist
+        if not hasattr(self, 'perfect_signals'):
+            self.perfect_signals = {method: [] for method in DETECTION_METHODS}
+        
+        # For each method, check if current quality is 1
+        for method in DETECTION_METHODS:
+            quality = self.signal_qualities[method]
+            
+            # Consider values very close to 1 as perfect (accounting for floating-point precision)
+            if quality >= 0.99:
+                self.perfect_signals[method].append(1)
+            else:
+                self.perfect_signals[method].append(0)
+            
+            # Maintain a sliding window of the last 10 values
+            if len(self.perfect_signals[method]) > 10:
+                self.perfect_signals[method].pop(0)
+            
+            # Calculate moving average
+            if self.perfect_signals[method]:
+                perfect_avg = sum(self.perfect_signals[method]) / len(self.perfect_signals[method])
+                perfect_pct = perfect_avg * 100
+                
+                # Update method display with HR, quality, and perfect signal percentage
+                hr = self.heart_rates[method]
+                quality = self.signal_qualities[method]
+                self.method_results[method].config(
+                    text=f"{method}: {hr:.0f} BPM (Quality: {quality:.2f}, Perfect: {perfect_pct:.0f}%)"
+                )
+
+
     def update_frame(self):
         """Process each frame and update the GUI."""
         try:
@@ -651,6 +687,8 @@ class FaceDetectionGUI:
                             self.method_results[method].config(
                                 text=f"{method}: {method_hr:.0f} BPM (Quality: {method_quality:.2f})"
                             )
+                    
+                    self.track_perfect_signals()
                     
                     # Update display
                     if hr > 0:
